@@ -157,7 +157,6 @@ def _translate_data(data: MetricsData) -> List[Resource]:
 
                 pb2_scope_metrics.metrics.append(pb2_metric)
 
-    # return ExportMetricsServiceRequest(
     return get_resource_data(
         resource_metrics_dict,
         pb2.ResourceMetrics,
