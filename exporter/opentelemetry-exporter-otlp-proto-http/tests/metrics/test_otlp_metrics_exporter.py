@@ -19,12 +19,16 @@ import requests
 import responses
 
 from opentelemetry.exporter.otlp.proto.http import Compression
+from opentelemetry.exporter.otlp.proto.http.exporter import DEFAULT_COMPRESSION
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import (
-    DEFAULT_COMPRESSION,
     DEFAULT_ENDPOINT,
     DEFAULT_METRICS_EXPORT_PATH,
     DEFAULT_TIMEOUT,
     OTLPMetricExporter,
+    _is_backoff_v2,
+)
+from opentelemetry.exporter.otlp.proto.http.metric_exporter.encoder import (
+    _ProtobufEncoder,
 )
 from opentelemetry.sdk.environment_variables import (
     OTEL_EXPORTER_OTLP_CERTIFICATE,
@@ -220,7 +224,11 @@ class TestOTLPMetricExporter(unittest.TestCase):
 
             self.assertEqual(
                 cm.records[0].message,
-                "Header doesn't match the format: missingValue.",
+                (
+                    "Header format invalid! Header values in environment "
+                    "variables must be URL encoded per the OpenTelemetry "
+                    "Protocol Exporter specification: missingValue"
+                ),
             )
 
     @patch.object(requests.Session, "post")
@@ -262,22 +270,22 @@ class TestOTLPMetricExporter(unittest.TestCase):
             exporter.export(self.metrics["sum_int"]),
             MetricExportResult.SUCCESS,
         )
-
-        serialized_data = exporter._translate_data(self.metrics["sum_int"])
+        serialized_data = _ProtobufEncoder.serialize(self.metrics["sum_int"])
         mock_post.assert_called_once_with(
             url=exporter._endpoint,
-            data=serialized_data.SerializeToString(),
+            data=serialized_data,
             verify=exporter._certificate_file,
             timeout=exporter._timeout,
         )
 
     @responses.activate
-    @patch("opentelemetry.exporter.otlp.proto.http.metric_exporter.backoff")
-    @patch("opentelemetry.exporter.otlp.proto.http.metric_exporter.sleep")
+    @patch("opentelemetry.exporter.otlp.proto.http.exporter.backoff")
+    @patch("opentelemetry.exporter.otlp.proto.http.exporter.sleep")
     def test_handles_backoff_v2_api(self, mock_sleep, mock_backoff):
         # In backoff ~= 2.0.0 the first value yielded from expo is None.
         def generate_delays(*args, **kwargs):
-            yield None
+            if _is_backoff_v2:
+                yield None
             yield 1
 
         mock_backoff.expo.configure_mock(**{"side_effect": generate_delays})

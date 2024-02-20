@@ -11,35 +11,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 from os import environ
-from typing import Dict, Optional, Sequence, Any, Callable, List, Mapping
-from time import sleep
+from typing import Dict, Optional
 
 from opentelemetry.exporter.otlp.proto.http import Compression
 from opentelemetry.exporter.otlp.proto.http.exporter import (
-    OTLPExporterMixin, DEFAULT_COMPRESSION, DEFAULT_ENDPOINT, DEFAULT_TIMEOUT
+    _OTLPExporterMixin,
+    DEFAULT_ENDPOINT,
+    DEFAULT_TIMEOUT,
+    _compression_from_env,
 )
 from opentelemetry.sdk.metrics._internal.aggregation import Aggregation
-from opentelemetry.proto.collector.metrics.v1.metrics_service_pb2 import (
-    ExportMetricsServiceRequest,
-)
-from opentelemetry.proto.common.v1.common_pb2 import (
-    AnyValue,
-    ArrayValue,
-    KeyValue,
-    KeyValueList,
-)
-from opentelemetry.proto.common.v1.common_pb2 import InstrumentationScope
-from opentelemetry.proto.resource.v1.resource_pb2 import Resource
-from opentelemetry.proto.metrics.v1 import metrics_pb2 as pb2
+
 from opentelemetry.sdk.environment_variables import (
     OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE,
     OTEL_EXPORTER_OTLP_ENDPOINT,
     OTEL_EXPORTER_OTLP_CERTIFICATE,
     OTEL_EXPORTER_OTLP_HEADERS,
     OTEL_EXPORTER_OTLP_TIMEOUT,
-    OTEL_EXPORTER_OTLP_COMPRESSION,
     OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
     OTEL_EXPORTER_OTLP_METRICS_CERTIFICATE,
     OTEL_EXPORTER_OTLP_METRICS_HEADERS,
@@ -56,43 +45,28 @@ from opentelemetry.sdk.metrics import (
 )
 from opentelemetry.sdk.metrics.export import (
     AggregationTemporality,
-    Gauge,
-    Histogram as HistogramType,
     MetricExporter,
     MetricExportResult,
     MetricsData,
     ResourceMetrics,
-    Sum,
 )
-from opentelemetry.sdk.resources import Resource as SDKResource
-from opentelemetry.util.re import parse_headers
-
-import backoff
+from opentelemetry.util.re import parse_env_headers
+from opentelemetry.exporter.otlp.proto.http.metric_exporter.encoder import (
+    _ProtobufEncoder,
+)
 import requests
-
-_logger = logging.getLogger(__name__)
 
 
 DEFAULT_METRICS_EXPORT_PATH = "v1/metrics"
 
-# Work around API change between backoff 1.x and 2.x. Since 2.0.0 the backoff
-# wait generator API requires a first .send(None) before reading the backoff
-# values from the generator.
-_is_backoff_v2 = next(backoff.expo()) is None
-
-
-def _expo(*args, **kwargs):
-    gen = backoff.expo(*args, **kwargs)
-    if _is_backoff_v2:
-        gen.send(None)
-    return gen
-
 
 class OTLPMetricExporter(
-    MetricExporter, OTLPExporterMixin[ResourceMetrics, MetricExportResult]
+    MetricExporter, _OTLPExporterMixin[ResourceMetrics, MetricExportResult]
 ):
 
     _MAX_RETRY_TIMEOUT = 64
+    _encoder = _ProtobufEncoder
+    _result = MetricExportResult
 
     def __init__(
         self,
@@ -119,14 +93,16 @@ class OTLPMetricExporter(
             OTEL_EXPORTER_OTLP_METRICS_HEADERS,
             environ.get(OTEL_EXPORTER_OTLP_HEADERS, ""),
         )
-        self._headers = headers or parse_headers(headers_string)
+        self._headers = headers or parse_env_headers(headers_string)
         self._timeout = timeout or int(
             environ.get(
                 OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
                 environ.get(OTEL_EXPORTER_OTLP_TIMEOUT, DEFAULT_TIMEOUT),
             )
         )
-        self._compression = compression or _compression_from_env()
+        self._compression = compression or _compression_from_env(
+            OTEL_EXPORTER_OTLP_METRICS_COMPRESSION
+        )
         self._session = session or requests.Session()
         self._session.headers.update(self._headers)
         self._session.headers.update(
@@ -166,7 +142,7 @@ class OTLPMetricExporter(
             }
         instrument_class_temporality.update(preferred_temporality or {})
 
-        OTLPExporterMixin.__init__(
+        _OTLPExporterMixin.__init__(
             self,
             self._endpoint,
             self._certificate_file,
@@ -182,165 +158,13 @@ class OTLPMetricExporter(
             preferred_aggregation=preferred_aggregation,
         )
 
-    def _translate_data(
-        self, data: MetricsData
-    ) -> ExportMetricsServiceRequest:
-
-        resource_metrics_dict = {}
-
-        for resource_metrics in data.resource_metrics:
-
-            resource = resource_metrics.resource
-
-            # It is safe to assume that each entry in data.resource_metrics is
-            # associated with an unique resource.
-            scope_metrics_dict = {}
-
-            resource_metrics_dict[resource] = scope_metrics_dict
-
-            for scope_metrics in resource_metrics.scope_metrics:
-
-                instrumentation_scope = scope_metrics.scope
-
-                # The SDK groups metrics in instrumentation scopes already so
-                # there is no need to check for existing instrumentation scopes
-                # here.
-                pb2_scope_metrics = pb2.ScopeMetrics(
-                    scope=InstrumentationScope(
-                        name=instrumentation_scope.name,
-                        version=instrumentation_scope.version,
-                    )
-                )
-
-                scope_metrics_dict[instrumentation_scope] = pb2_scope_metrics
-
-                for metric in scope_metrics.metrics:
-                    pb2_metric = pb2.Metric(
-                        name=metric.name,
-                        description=metric.description,
-                        unit=metric.unit,
-                    )
-
-                    if isinstance(metric.data, Gauge):
-                        for data_point in metric.data.data_points:
-                            pt = pb2.NumberDataPoint(
-                                attributes=self._translate_attributes(
-                                    data_point.attributes
-                                ),
-                                time_unix_nano=data_point.time_unix_nano,
-                            )
-                            if isinstance(data_point.value, int):
-                                pt.as_int = data_point.value
-                            else:
-                                pt.as_double = data_point.value
-                            pb2_metric.gauge.data_points.append(pt)
-
-                    elif isinstance(metric.data, HistogramType):
-                        for data_point in metric.data.data_points:
-                            pt = pb2.HistogramDataPoint(
-                                attributes=self._translate_attributes(
-                                    data_point.attributes
-                                ),
-                                time_unix_nano=data_point.time_unix_nano,
-                                start_time_unix_nano=(
-                                    data_point.start_time_unix_nano
-                                ),
-                                count=data_point.count,
-                                sum=data_point.sum,
-                                bucket_counts=data_point.bucket_counts,
-                                explicit_bounds=data_point.explicit_bounds,
-                                max=data_point.max,
-                                min=data_point.min,
-                            )
-                            pb2_metric.histogram.aggregation_temporality = (
-                                metric.data.aggregation_temporality
-                            )
-                            pb2_metric.histogram.data_points.append(pt)
-
-                    elif isinstance(metric.data, Sum):
-                        for data_point in metric.data.data_points:
-                            pt = pb2.NumberDataPoint(
-                                attributes=self._translate_attributes(
-                                    data_point.attributes
-                                ),
-                                start_time_unix_nano=(
-                                    data_point.start_time_unix_nano
-                                ),
-                                time_unix_nano=data_point.time_unix_nano,
-                            )
-                            if isinstance(data_point.value, int):
-                                pt.as_int = data_point.value
-                            else:
-                                pt.as_double = data_point.value
-                            # note that because sum is a message type, the
-                            # fields must be set individually rather than
-                            # instantiating a pb2.Sum and setting it once
-                            pb2_metric.sum.aggregation_temporality = (
-                                metric.data.aggregation_temporality
-                            )
-                            pb2_metric.sum.is_monotonic = (
-                                metric.data.is_monotonic
-                            )
-                            pb2_metric.sum.data_points.append(pt)
-                    else:
-                        _logger.warn(
-                            "unsupported datapoint type %s", metric.point
-                        )
-                        continue
-
-                    pb2_scope_metrics.metrics.append(pb2_metric)
-
-        return ExportMetricsServiceRequest(
-            resource_metrics=get_resource_data(
-                resource_metrics_dict,
-                pb2.ResourceMetrics,
-                "metrics",
-            )
-        )
-
-    def _translate_attributes(self, attributes) -> Sequence[KeyValue]:
-        output = []
-        if attributes:
-
-            for key, value in attributes.items():
-                try:
-                    output.append(_translate_key_values(key, value))
-                except Exception as error:  # pylint: disable=broad-except
-                    _logger.exception(error)
-        return output
-
     def export(
         self,
         metrics_data: MetricsData,
         timeout_millis: float = 10_000,
         **kwargs,
     ) -> MetricExportResult:
-        serialized_data = self._translate_data(metrics_data)
-        for delay in _expo(max_value=self._MAX_RETRY_TIMEOUT):
-
-            if delay == self._MAX_RETRY_TIMEOUT:
-                return MetricExportResult.FAILURE
-
-            resp = self._export(serialized_data.SerializeToString())
-            # pylint: disable=no-else-return
-            if resp.status_code in (200, 202):
-                return MetricExportResult.SUCCESS
-            elif self._retryable(resp):
-                _logger.warning(
-                    "Transient error %s encountered while exporting metric batch, retrying in %ss.",
-                    resp.reason,
-                    delay,
-                )
-                sleep(delay)
-                continue
-            else:
-                _logger.error(
-                    "Failed to export batch code: %s, reason: %s",
-                    resp.status_code,
-                    resp.text,
-                )
-                return MetricExportResult.FAILURE
-        return MetricExportResult.FAILURE
+        return _OTLPExporterMixin.export(self, metrics_data)
 
     def shutdown(self, timeout_millis: float = 30_000, **kwargs) -> None:
         pass
@@ -351,93 +175,6 @@ class OTLPMetricExporter(
 
     def force_flush(self, timeout_millis: float = 10_000) -> bool:
         return True
-
-
-def _translate_value(value: Any) -> KeyValue:
-
-    if isinstance(value, bool):
-        any_value = AnyValue(bool_value=value)
-
-    elif isinstance(value, str):
-        any_value = AnyValue(string_value=value)
-
-    elif isinstance(value, int):
-        any_value = AnyValue(int_value=value)
-
-    elif isinstance(value, float):
-        any_value = AnyValue(double_value=value)
-
-    elif isinstance(value, Sequence):
-        any_value = AnyValue(
-            array_value=ArrayValue(values=[_translate_value(v) for v in value])
-        )
-
-    elif isinstance(value, Mapping):
-        any_value = AnyValue(
-            kvlist_value=KeyValueList(
-                values=[
-                    _translate_key_values(str(k), v) for k, v in value.items()
-                ]
-            )
-        )
-
-    else:
-        raise Exception(f"Invalid type {type(value)} of value {value}")
-
-    return any_value
-
-
-def _translate_key_values(key: str, value: Any) -> KeyValue:
-    return KeyValue(key=key, value=_translate_value(value))
-
-
-def get_resource_data(
-    sdk_resource_scope_data: Dict[SDKResource, Any],  # ResourceDataT?
-    resource_class: Callable[..., Resource],
-    name: str,
-) -> List[Resource]:
-
-    resource_data = []
-
-    for (
-        sdk_resource,
-        scope_data,
-    ) in sdk_resource_scope_data.items():
-
-        collector_resource = Resource()
-
-        for key, value in sdk_resource.attributes.items():
-
-            try:
-                # pylint: disable=no-member
-                collector_resource.attributes.append(
-                    _translate_key_values(key, value)
-                )
-            except Exception as error:  # pylint: disable=broad-except
-                _logger.exception(error)
-
-        resource_data.append(
-            resource_class(
-                **{
-                    "resource": collector_resource,
-                    "scope_{}".format(name): scope_data.values(),
-                }
-            )
-        )
-
-    return resource_data
-
-
-def _compression_from_env() -> Compression:
-    compression = (
-        environ.get(
-            OTEL_EXPORTER_OTLP_METRICS_COMPRESSION,
-            environ.get(OTEL_EXPORTER_OTLP_COMPRESSION, "none"),
-        )
-        .lower()
-        .strip()
-    )
-    return Compression(compression)
 
 
 def _append_metrics_path(endpoint: str) -> str:

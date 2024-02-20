@@ -21,13 +21,14 @@ from unittest.mock import MagicMock, patch
 import requests
 import responses
 
+from opentelemetry._logs import SeverityNumber
 from opentelemetry.exporter.otlp.proto.http import Compression
 from opentelemetry.exporter.otlp.proto.http._log_exporter import (
-    DEFAULT_COMPRESSION,
     DEFAULT_ENDPOINT,
     DEFAULT_LOGS_EXPORT_PATH,
     DEFAULT_TIMEOUT,
     OTLPLogExporter,
+    _is_backoff_v2,
 )
 from opentelemetry.exporter.otlp.proto.http._log_exporter.encoder import (
     _encode_attributes,
@@ -36,6 +37,7 @@ from opentelemetry.exporter.otlp.proto.http._log_exporter.encoder import (
     _encode_value,
     _ProtobufEncoder,
 )
+from opentelemetry.exporter.otlp.proto.http.exporter import DEFAULT_COMPRESSION
 from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import (
     ExportLogsServiceRequest,
 )
@@ -54,7 +56,6 @@ from opentelemetry.proto.resource.v1.resource_pb2 import (
 )
 from opentelemetry.sdk._logs import LogData
 from opentelemetry.sdk._logs import LogRecord as SDKLogRecord
-from opentelemetry.sdk._logs.severity import SeverityNumber
 from opentelemetry.sdk.environment_variables import (
     OTEL_EXPORTER_OTLP_CERTIFICATE,
     OTEL_EXPORTER_OTLP_COMPRESSION,
@@ -161,12 +162,13 @@ class TestOTLPHTTPLogExporter(unittest.TestCase):
         )
 
     @responses.activate
-    @patch("opentelemetry.exporter.otlp.proto.http._log_exporter.backoff")
-    @patch("opentelemetry.exporter.otlp.proto.http._log_exporter.sleep")
+    @patch("opentelemetry.exporter.otlp.proto.http.exporter.backoff")
+    @patch("opentelemetry.exporter.otlp.proto.http.exporter.sleep")
     def test_handles_backoff_v2_api(self, mock_sleep, mock_backoff):
         # In backoff ~= 2.0.0 the first value yielded from expo is None.
         def generate_delays(*args, **kwargs):
-            yield None
+            if _is_backoff_v2:
+                yield None
             yield 1
 
         mock_backoff.expo.configure_mock(**{"side_effect": generate_delays})

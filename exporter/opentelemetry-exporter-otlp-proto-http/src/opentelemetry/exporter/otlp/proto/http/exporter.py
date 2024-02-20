@@ -12,28 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import gzip
 import zlib
+from os import environ
 from io import BytesIO
 from typing import Dict, Optional, Generic, TypeVar, Sequence
-from abc import ABC, abstractmethod
+from abc import ABC
+from time import sleep
 
 import requests
+import backoff
+
 from opentelemetry.exporter.otlp.proto.http import (
     _OTLP_HTTP_HEADERS,
     Compression,
 )
 
-SDKDataT = TypeVar("SDKDataT")
-ExportResultT = TypeVar("ExportResultT")
+from opentelemetry.sdk.environment_variables import (
+    OTEL_EXPORTER_OTLP_COMPRESSION,
+)
+
+_logger = logging.getLogger(__name__)
+
+_SDKDataT = TypeVar("_SDKDataT")
+_ExportResultT = TypeVar("_ExportResultT")
 
 
 DEFAULT_COMPRESSION = Compression.NoCompression
 DEFAULT_ENDPOINT = "http://localhost:4318/"
 DEFAULT_TIMEOUT = 10  # in seconds
 
+# Work around API change between backoff 1.x and 2.x. Since 2.0.0 the backoff
+# wait generator API requires a first .send(None) before reading the backoff
+# values from the generator.
+_is_backoff_v2 = next(backoff.expo()) is None
 
-class OTLPExporterMixin(ABC, Generic[SDKDataT, ExportResultT]):
+
+def _expo(*args, **kwargs):
+    gen = backoff.expo(*args, **kwargs)
+    if _is_backoff_v2:
+        gen.send(None)
+    return gen
+
+
+class _OTLPExporterMixin(ABC, Generic[_SDKDataT, _ExportResultT]):
 
     _MAX_RETRY_TIMEOUT = 64
 
@@ -86,10 +109,53 @@ class OTLPExporterMixin(ABC, Generic[SDKDataT, ExportResultT]):
             return True
         return False
 
-    @abstractmethod
     def export(
         self,
-        data: Sequence[SDKDataT],
+        data: Sequence[_SDKDataT],
         **kwargs,
-    ) -> ExportResultT:
-        pass
+    ) -> _ExportResultT:
+        # After the call to Shutdown subsequent calls to Export are
+        # not allowed and should return a Failure result.
+        if self._shutdown:
+            _logger.warning("Exporter already shutdown, ignoring batch")
+            return self._result.FAILURE
+
+        serialized_data = self._encoder.serialize(data)
+
+        for delay in _expo(max_value=self._MAX_RETRY_TIMEOUT):
+
+            if delay == self._MAX_RETRY_TIMEOUT:
+                return self._result.FAILURE
+
+            resp = self._export(serialized_data)
+            # pylint: disable=no-else-return
+            if resp.status_code in (200, 202):
+                return self._result.SUCCESS
+            elif self._retryable(resp):
+                _logger.warning(
+                    "Transient error %s encountered while exporting batch, retrying in %ss.",
+                    resp.reason,
+                    delay,
+                )
+                sleep(delay)
+                continue
+            else:
+                _logger.error(
+                    "Failed to export batch code: %s, reason: %s",
+                    resp.status_code,
+                    resp.text,
+                )
+                return self._result.FAILURE
+        return self._result.FAILURE
+
+
+def _compression_from_env(key) -> Compression:
+    compression = (
+        environ.get(
+            key,
+            environ.get(OTEL_EXPORTER_OTLP_COMPRESSION, "none"),
+        )
+        .lower()
+        .strip()
+    )
+    return Compression(compression)

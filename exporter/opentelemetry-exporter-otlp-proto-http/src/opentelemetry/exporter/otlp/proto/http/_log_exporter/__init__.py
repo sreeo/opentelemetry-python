@@ -15,9 +15,7 @@
 import logging
 from os import environ
 from typing import Dict, Optional, Sequence
-from time import sleep
 
-import backoff
 import requests
 
 from opentelemetry.sdk.environment_variables import (
@@ -27,22 +25,26 @@ from opentelemetry.sdk.environment_variables import (
     OTEL_EXPORTER_OTLP_HEADERS,
     OTEL_EXPORTER_OTLP_TIMEOUT,
 )
+from opentelemetry.sdk._logs import LogData
 from opentelemetry.sdk._logs.export import (
     LogExporter,
     LogExportResult,
-    LogData,
 )
 from opentelemetry.exporter.otlp.proto.http import (
     _OTLP_HTTP_HEADERS,
     Compression,
 )
 from opentelemetry.exporter.otlp.proto.http.exporter import (
-    OTLPExporterMixin, DEFAULT_COMPRESSION, DEFAULT_ENDPOINT, DEFAULT_TIMEOUT)
+    _OTLPExporterMixin,
+    DEFAULT_ENDPOINT,
+    DEFAULT_TIMEOUT,
+    _compression_from_env,
+)
 
 from opentelemetry.exporter.otlp.proto.http._log_exporter.encoder import (
     _ProtobufEncoder,
 )
-from opentelemetry.util.re import parse_headers
+from opentelemetry.util.re import parse_env_headers
 
 
 _logger = logging.getLogger(__name__)
@@ -50,24 +52,14 @@ _logger = logging.getLogger(__name__)
 
 DEFAULT_LOGS_EXPORT_PATH = "v1/logs"
 
-# Work around API change between backoff 1.x and 2.x. Since 2.0.0 the backoff
-# wait generator API requires a first .send(None) before reading the backoff
-# values from the generator.
-_is_backoff_v2 = next(backoff.expo()) is None
-
-
-def _expo(*args, **kwargs):
-    gen = backoff.expo(*args, **kwargs)
-    if _is_backoff_v2:
-        gen.send(None)
-    return gen
-
 
 class OTLPLogExporter(
-    LogExporter, OTLPExporterMixin[LogData, LogExportResult]
+    LogExporter, _OTLPExporterMixin[LogData, LogExportResult]
 ):
 
     _MAX_RETRY_TIMEOUT = 64
+    _result = LogExportResult
+    _encoder = _ProtobufEncoder
 
     def __init__(
         self,
@@ -85,11 +77,13 @@ class OTLPLogExporter(
             OTEL_EXPORTER_OTLP_CERTIFICATE, True
         )
         headers_string = environ.get(OTEL_EXPORTER_OTLP_HEADERS, "")
-        self._headers = headers or parse_headers(headers_string)
+        self._headers = headers or parse_env_headers(headers_string)
         self._timeout = timeout or int(
             environ.get(OTEL_EXPORTER_OTLP_TIMEOUT, DEFAULT_TIMEOUT)
         )
-        self._compression = compression or _compression_from_env()
+        self._compression = compression or _compression_from_env(
+            OTEL_EXPORTER_OTLP_COMPRESSION
+        )
         self._session = session or requests.Session()
         self._session.headers.update(self._headers)
         self._session.headers.update(_OTLP_HTTP_HEADERS)
@@ -98,7 +92,7 @@ class OTLPLogExporter(
                 {"Content-Encoding": self._compression.value}
             )
         self._shutdown = False
-        OTLPExporterMixin.__init__(
+        _OTLPExporterMixin.__init__(
             self,
             self._endpoint,
             self._certificate_file,
@@ -109,39 +103,7 @@ class OTLPLogExporter(
         )
 
     def export(self, batch: Sequence[LogData]) -> LogExportResult:
-        # After the call to Shutdown subsequent calls to Export are
-        # not allowed and should return a Failure result.
-        if self._shutdown:
-            _logger.warning("Exporter already shutdown, ignoring batch")
-            return LogExportResult.FAILURE
-
-        serialized_data = _ProtobufEncoder.serialize(batch)
-
-        for delay in _expo(max_value=self._MAX_RETRY_TIMEOUT):
-
-            if delay == self._MAX_RETRY_TIMEOUT:
-                return LogExportResult.FAILURE
-
-            resp = self._export(serialized_data)
-            # pylint: disable=no-else-return
-            if resp.status_code in (200, 202):
-                return LogExportResult.SUCCESS
-            elif self._retryable(resp):
-                _logger.warning(
-                    "Transient error %s encountered while exporting logs batch, retrying in %ss.",
-                    resp.reason,
-                    delay,
-                )
-                sleep(delay)
-                continue
-            else:
-                _logger.error(
-                    "Failed to export logs batch code: %s, reason: %s",
-                    resp.status_code,
-                    resp.text,
-                )
-                return LogExportResult.FAILURE
-        return LogExportResult.FAILURE
+        return _OTLPExporterMixin.export(self, batch)
 
     def shutdown(self):
         if self._shutdown:
@@ -149,13 +111,6 @@ class OTLPLogExporter(
             return
         self._session.close()
         self._shutdown = True
-
-
-def _compression_from_env() -> Compression:
-    compression = (
-        environ.get(OTEL_EXPORTER_OTLP_COMPRESSION, "none").lower().strip()
-    )
-    return Compression(compression)
 
 
 def _append_logs_path(endpoint: str) -> str:
